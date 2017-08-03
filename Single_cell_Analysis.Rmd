@@ -1,0 +1,156 @@
+---
+title: "Single cell RNA-seq analysis"
+subtitle: "scater & SC3"
+output:
+  html_document:
+    theme: flatly
+    highlight: tango
+---
+
+###Prepare data
+####Load packages
+```{r, message=FALSE, warning=FALSE}
+library(scater,quietly = T)
+library(SC3)
+library(cowplot)
+options(stringsAsFactors = F)
+```
+####Read in counts table and sample information.
+
+```{r, message=FALSE, warning=FALSE}
+setwd("/data/SKDngs01/pg/collaborators/junke/SingleCell/Fastq/analysis/PBMC/Merged_internal")
+reads<- read.csv("count.table.csv")
+ph<- read.csv("sampleInfo.csv")
+ann<-read.csv("RNASeqData.Count_Annotation.csv")
+```
+####Prepare required data frame
+```{r, message=FALSE, warning=FALSE}
+rownames(reads)<-reads$X
+reads <- reads[,-1]
+
+pd <- new("AnnotatedDataFrame", data = as.data.frame(ph))
+rownames(pd) <- pd$SampleName
+
+fd <- new("AnnotatedDataFrame", data = as.data.frame(ann))
+rownames(fd) <- fd$GeneID
+
+reads <- scater::newSCESet(
+  countData = reads,
+  phenoData = pd,
+  featureData = fd
+)
+```
+###Quality control: 
+####Filter out genes that are expressed in less than 2 cells, filter out samples whose total detected gene is less than 500.
+```{r, message=FALSE, warning=FALSE}
+keep_feature <- rowSums(counts(reads) > 2) > 2 
+keep_samples <- !ph$rmSample
+reads <- reads[keep_feature, keep_samples]
+qc <- calculateQCMetrics(reads)
+keep_feature <- apply(counts(reads),1,var)>1
+keep_samples <- pData(qc)$total_features > 500
+reads<- reads[keep_feature,keep_samples]
+qc <- calculateQCMetrics(reads)
+```
+####Number of remaining samples/genes.
+
+```{r, message=FALSE, warning=FALSE}
+dim(reads)
+```
+
+###Analysis
+####Run PCA to get a overview.
+```{r, fig.height=4, fig.width=5, message=FALSE, warning=FALSE}
+tmp<-plotPCA(qc,colour_by="Batch",shape_by="Treatment", exprs_values = "exprs")
+tmp+geom_point(aes(colour=pData(qc)$Batch,shape=pData(qc)$Treatment),size=4)+scale_color_brewer(name="Batch",palette="Set1")
+```
+
+As we see from the PCA plot, there is batch effect between internal and public data.
+
+
+####Refer variance plot to confirm ther main variance in phenodata.
+```{r, message=FALSE, warning=FALSE}
+plotQC(qc,type="explanatory-variables")
+```
+
+Variance analysis also indicates that the batch effect has most impact on data set.
+
+
+####See expression level of marker genes over t-SNE plot
+```{r, fig.height=4, fig.width=5, message=FALSE, warning=FALSE}
+il=plotTSNE(qc,perplexity=20,rand_seed=0)
+il+geom_point(aes(colour=pData(qc)$Batch),size=4)+scale_color_brewer(name="Batch",palette="Set1")
+plot_grid(
+  il + geom_point(aes(colour=exprs(qc)["CD2",]),size=2)+scale_color_gradient(name="CD2",low="lightsteelblue",high = "orangered"),
+  il + geom_point(aes(colour=exprs(qc)["CD52",]),size=2)+scale_color_gradient(name="CD52",low="lightsteelblue",high = "orangered"),
+  il + geom_point(aes(colour=exprs(qc)["CD3D",]),size=2)+scale_color_gradient(name="CD3D",low="lightsteelblue",high = "orangered"),
+  il + geom_point(aes(colour=exprs(qc)["CD3G",]),size=2)+scale_color_gradient(name="CD3G",low="lightsteelblue",high = "orangered")
+)
+```
+
+###Clustering
+####Do k-means clustering on t-SNE to define cell clusters
+```{r}
+tsne <- plotTSNE(qc, exprs_calues="exprs",return_SCESet =T, rand_seed =0,perplexity=20)
+```
+
+####Do concensus clustering
+```{r}
+sc <- sc3(qc, ks = 2:4, biology = TRUE, n_cores = 16)
+##turn on sc3 app
+#sc3_interactive(sc)
+```
+Using the sc3 app to define #of clusters manually is the quickest way, silouettt index may not always give the optimal result.
+
+####Comparing two clustering results
+```{r}
+pData(sc)$tSNE_kmeans <- as.character(kmeans(tsne@reducedDimension, centers = 3)$clust)
+t <- plotTSNE(sc, exprs_calues="exprs", rand_seed =0,perplexity=20)
+plot_grid(
+  t+geom_point(aes(colour=pData(sc)$tSNE_kmeans),size=4)+scale_color_brewer(name="tSNE_kmeans",palette="Set1"),
+  t+geom_point(aes(colour=as.factor(pData(sc)$sc3_4_clusters)),size=4)+scale_color_brewer(name="sc3_3_clusters",palette="Set1")
+)
+```
+
+###Marker analysis
+####Find markers based on sc3 clustering
+```{r}
+sc3_plot_markers(sc,4,auroc=0.85,p.val=0.05,show_pdata="tSNE_kmeans")
+```
+
+####Find markers based on tSNE-kmeans clustering
+```{r}
+group <- pData(sc)["tSNE_kmeans"]
+group <- as.data.frame(t(group))
+exprsmat <- exprs(reads)
+colnames(exprsmat) <- group[1,]
+markers <- get_marker_genes(exprsmat,colnames(exprsmat))
+rownames(markers) <- rownames(exprsmat)
+colnames(markers) <- c("sc3_k_markers_auroc","sc3_k_markers_clusts","sc3_k_markers_padj")
+filtermarkers <- markers[complete.cases(markers),]
+```
+#####need to change AUROC&PVAL threshold here
+```{r}
+filtermarkers <- filtermarkers[filtermarkers[,3]<0.1,]
+filtermarkers <- filtermarkers[filtermarkers[,1]>0.8,]
+```
+#####draw plots
+```{r}
+filtermarkers <- as.data.frame(filtermarkers)
+filtermarkers <- filtermarkers[order(filtermarkers$sc3_k_markers_clust),]
+filtermarkers[,2] <- as.numeric(filtermarkers[,2])
+
+row.ann <- data.frame(Cluster=factor(filtermarkers[,2],levels=unique(filtermarkers[,2])))
+rownames(row.ann)<- rownames(filtermarkers)
+kmeans_group <- as.data.frame(pData(sc)[order(pData(sc)$tSNE_kmeans),])
+kmeans_group$tSNE_kmeans <- as.numeric(kmeans_group$tSNE_kmeans)
+col.ann <- data.frame(Kmeans_cluster=factor(kmeans_group$tSNE_kmeans,levels=unique(kmeans_group$tSNE_kmeans)))
+rownames(col.ann) <- rownames(kmeans_group)
+
+tmp <- exprs(reads)
+pheatmap::pheatmap(tmp[rownames(filtermarkers),rownames(kmeans_group), drop = FALSE],cluster_rows = FALSE, cluster_cols = FALSE, 
+                   color = colorRampPalette(c("black", "yellow"))(50),
+                   annotation_row = row.ann, gaps_row = which(diff(filtermarkers[, 2]) != 0),
+                   annotation_col = col.ann, gaps_col = which(diff(kmeans_group$tSNE_kmeans)!=0))
+```
+
